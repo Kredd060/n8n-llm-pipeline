@@ -1,0 +1,504 @@
+{
+  "name": "4-LLM Autonomous Business Pipeline",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": "4llm-business-pipeline-v1"
+  },
+  "tags": ["llm-pipeline", "autonomous", "business"],
+  "nodes": [
+
+    {
+      "id": "node-0001-webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [200, 320],
+      "webhookId": "4llm-business-pipeline-entry",
+      "parameters": {
+        "path": "business-pipeline",
+        "httpMethod": "POST",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "notes": "Entry point. POST JSON body: { \"prompt\": \"Your business idea prompt here\" }"
+    },
+
+    {
+      "id": "node-0002-initialize",
+      "name": "Initialize Pipeline",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 320],
+      "parameters": {
+        "jsCode": "// ── STAGE 0: Initialize all pipeline state ──────────────────────────────\n// Accepts: { prompt: string }\n// Returns: full pipeline state object\n\nconst body = $input.item.json.body || $input.item.json;\n\nif (!body.prompt || typeof body.prompt !== 'string' || body.prompt.trim() === '') {\n  throw new Error('Missing or empty required field: prompt. Send POST { \"prompt\": \"your idea\" }');\n}\n\nconst rowId = 'ROW-' + Date.now();\nconst timestamp = new Date().toISOString();\n\nreturn {\n  json: {\n    rowId:        rowId,\n    timestamp:    timestamp,\n    prompt:       body.prompt.trim(),\n\n    // Stage 1 output\n    gptIdea:      '',\n\n    // Stage 2 output (Gemini-formatted version)\n    geminiFormatted: '',\n\n    // Stage 3 — critique loop state (max 3 cycles)\n    cycleCount:   0,\n    critique1:    '',\n    critique2:    '',\n    critique3:    '',\n    approved:     false,\n    finalConcept: '',\n\n    // Stage 4 output\n    researchSummary: '',\n    sources:         '',\n    notes:           '',\n\n    // Overall tracking\n    status:       'Processing',\n    sheetsRowNum: 0\n  }\n};"
+      }
+    },
+
+    {
+      "id": "node-0003-gpt-generate",
+      "name": "GPT-4o Mini - Generate Idea",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [640, 320],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: 'gpt-4o-mini',\n  max_tokens: 800,\n  temperature: 0.8,\n  messages: [\n    {\n      role: 'system',\n      content: 'You are a creative business strategist. When given a business prompt, generate a clear, innovative, and executable business idea. Respond ONLY with a valid JSON object — no markdown, no code fences — using these exact fields: { \"core_idea\": \"2-3 sentence summary\", \"target_market\": \"who this serves\", \"value_proposition\": \"why it wins\", \"revenue_model\": \"how it makes money\", \"implementation_steps\": [\"step1\", \"step2\", \"step3\"] }'\n    },\n    {\n      role: 'user',\n      content: $json.prompt\n    }\n  ]\n}) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI API Key"
+        }
+      },
+      "notes": "CREDENTIAL SETUP: Create an n8n HTTP Header Auth credential named 'OpenAI API Key'. Header Name: Authorization | Header Value: Bearer sk-YOUR_KEY"
+    },
+
+    {
+      "id": "node-0004-parse-gpt",
+      "name": "Parse GPT Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [860, 320],
+      "parameters": {
+        "jsCode": "// ── STAGE 1 PARSE: Extract idea from GPT-4o Mini response ───────────────\nconst pipeline = $('Initialize Pipeline').item.json;\nconst gptRaw   = $input.item.json;\n\nlet ideaText = '';\ntry {\n  const content = gptRaw.choices[0].message.content.trim();\n  // Try to parse as JSON (GPT was instructed to return JSON)\n  const parsed = JSON.parse(content);\n  ideaText = [\n    '**Core Idea:** '          + (parsed.core_idea          || ''),\n    '**Target Market:** '      + (parsed.target_market      || ''),\n    '**Value Proposition:** '  + (parsed.value_proposition  || ''),\n    '**Revenue Model:** '      + (parsed.revenue_model      || ''),\n    '**Implementation:** '     + (parsed.implementation_steps ? parsed.implementation_steps.join(' → ') : '')\n  ].join('\\n');\n} catch (e) {\n  // Fallback: use raw text if JSON parse fails\n  ideaText = gptRaw.choices[0].message.content.trim();\n}\n\nif (!ideaText) throw new Error('GPT-4o Mini returned an empty response.');\n\nreturn {\n  json: {\n    ...pipeline,\n    gptIdea: ideaText\n  }\n};"
+      }
+    },
+
+    {
+      "id": "node-0005-gemini-format",
+      "name": "Gemini 1.5 Flash - Format & Structure",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1080, 320],
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  contents: [\n    {\n      parts: [\n        {\n          text: 'You are a structured business analyst. Your job is to take a raw business idea and format it into a clean, concise summary ready for database logging and review. Original Prompt: \"' + $json.prompt + '\" Raw Idea from GPT-4o Mini: \"' + $json.gptIdea + '\" Return ONLY a JSON object with these exact fields (no markdown, no code fences): { \"formatted_concept\": \"A clean 3-5 sentence executive summary of the business concept\", \"category\": \"Industry/sector tag (1-3 words)\", \"complexity\": \"Low | Medium | High\", \"confidence_score\": 0.0 to 1.0 }'\n        }\n      ]\n    }\n  ],\n  generationConfig: {\n    temperature: 0.4,\n    maxOutputTokens: 500\n  }\n}) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_GEMINI_CREDENTIAL_ID",
+          "name": "Google AI Studio API Key"
+        }
+      },
+      "notes": "CREDENTIAL SETUP: Create an HTTP Header Auth credential named 'Google AI Studio API Key'. Header Name: x-goog-api-key | Header Value: YOUR_GOOGLE_AI_STUDIO_KEY"
+    },
+
+    {
+      "id": "node-0006-parse-gemini",
+      "name": "Parse Gemini Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1300, 320],
+      "parameters": {
+        "jsCode": "// ── STAGE 2 PARSE: Extract structured data from Gemini response ──────────\nconst pipeline  = $('Parse GPT Response').item.json;\nconst geminiRaw = $input.item.json;\n\nlet geminiFormatted = pipeline.gptIdea; // fallback to GPT idea if Gemini fails\n\ntry {\n  const content = geminiRaw.candidates[0].content.parts[0].text.trim();\n  const parsed  = JSON.parse(content);\n  geminiFormatted = [\n    parsed.formatted_concept || pipeline.gptIdea,\n    parsed.category   ? '[Category: '   + parsed.category   + ']' : '',\n    parsed.complexity ? '[Complexity: '  + parsed.complexity  + ']' : '',\n    parsed.confidence_score !== undefined ? '[Confidence: ' + (parsed.confidence_score * 100).toFixed(0) + '%]' : ''\n  ].filter(Boolean).join(' ');\n} catch (e) {\n  // Gemini didn't return valid JSON — use the raw text\n  try {\n    geminiFormatted = geminiRaw.candidates[0].content.parts[0].text.trim() || pipeline.gptIdea;\n  } catch (_) {\n    geminiFormatted = pipeline.gptIdea;\n  }\n}\n\nreturn {\n  json: {\n    ...pipeline,\n    geminiFormatted: geminiFormatted\n  }\n};"
+      }
+    },
+
+    {
+      "id": "node-0007-sheets-init-log",
+      "name": "Google Sheets - Log Initial Entry",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1520, 320],
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_SPREADSHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Pipeline",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Row ID":          "={{ $json.rowId }}",
+            "Timestamp":       "={{ $json.timestamp }}",
+            "Original Prompt": "={{ $json.prompt }}",
+            "ChatGPT Idea":    "={{ $json.geminiFormatted }}",
+            "Cycle 1 Critique": "",
+            "Cycle 2 Critique": "",
+            "Cycle 3 Critique": "",
+            "Final Concept":   "",
+            "Status":          "Processing",
+            "Cycles Used":     "0",
+            "Research Summary": "",
+            "Sources":         "",
+            "Notes":           "Pipeline started"
+          },
+          "matchingColumns": ["Row ID"],
+          "schema": [
+            {"id": "Row ID",           "displayName": "Row ID",           "required": false, "defaultMatch": true,  "canBeUsedToMatch": true,  "display": true, "type": "string"},
+            {"id": "Timestamp",        "displayName": "Timestamp",        "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "Original Prompt",  "displayName": "Original Prompt",  "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "ChatGPT Idea",     "displayName": "ChatGPT Idea",     "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "Cycle 1 Critique", "displayName": "Cycle 1 Critique", "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "Cycle 2 Critique", "displayName": "Cycle 2 Critique", "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "Cycle 3 Critique", "displayName": "Cycle 3 Critique", "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "Final Concept",    "displayName": "Final Concept",    "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "Status",           "displayName": "Status",           "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "Cycles Used",      "displayName": "Cycles Used",      "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "Research Summary", "displayName": "Research Summary", "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "Sources",          "displayName": "Sources",          "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "Notes",            "displayName": "Notes",            "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"}
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_WITH_GSHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets OAuth2"
+        }
+      },
+      "notes": "CREDENTIAL SETUP: Create a Google Sheets OAuth2 credential. SPREADSHEET: Replace REPLACE_WITH_YOUR_SPREADSHEET_ID with your Sheet ID (found in the URL). Sheet tab must be named 'Pipeline' with headers in row 1 matching the 13-column schema."
+    },
+
+    {
+      "id": "node-0008-restore-state",
+      "name": "Restore Pipeline State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1740, 320],
+      "parameters": {
+        "jsCode": "// ── RESTORE: Google Sheets append doesn't pass pipeline data forward ──────\n// Re-attach all pipeline state so the loop has everything it needs.\nconst pipeline = $('Parse Gemini Response').item.json;\nconst sheetsResult = $input.item.json;\n\n// Google Sheets append returns the row number via 'row_number' or from range\nlet sheetsRowNum = 0;\nif (sheetsResult.row_number) {\n  sheetsRowNum = sheetsResult.row_number;\n} else if (sheetsResult.updatedRange) {\n  // Parse row from range like 'Pipeline!A5:M5'\n  const match = sheetsResult.updatedRange.match(/(\\d+)/);\n  if (match) sheetsRowNum = parseInt(match[1]);\n}\n\nreturn {\n  json: {\n    ...pipeline,\n    sheetsRowNum: sheetsRowNum\n  }\n};"
+      }
+    },
+
+    {
+      "id": "node-0009-loop-increment",
+      "name": "Critique Loop - Increment Cycle",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1960, 320],
+      "parameters": {
+        "jsCode": "// ── LOOP GATE: Increment cycle counter ───────────────────────────────────\n// This node is the loop-back target from the IF node's FALSE branch.\n// On first pass it receives data from Restore Pipeline State (cycleCount=0).\n// On subsequent passes it receives data from IF node (cycleCount=1,2).\n\nconst data = $input.item.json;\n\nreturn {\n  json: {\n    ...data,\n    cycleCount: (data.cycleCount || 0) + 1\n  }\n};"
+      },
+      "notes": "⚠️ LOOP TARGET: The FALSE output of 'IF - Exit Loop' connects BACK to this node. This creates the critique loop (max 3 cycles)."
+    },
+
+    {
+      "id": "node-0010-build-claude-prompt",
+      "name": "Build Claude Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2180, 320],
+      "parameters": {
+        "jsCode": "// ── CLAUDE PREP: Assemble the critique prompt with full context ───────────\nconst d = $input.item.json;\n\n// Collect any prior critiques for context\nconst priorCritiques = [];\nif (d.critique1) priorCritiques.push('Cycle 1 Critique: ' + d.critique1);\nif (d.critique2) priorCritiques.push('Cycle 2 Critique: ' + d.critique2);\nif (d.critique3) priorCritiques.push('Cycle 3 Critique: ' + d.critique3);\n\nconst priorContext = priorCritiques.length > 0\n  ? '\\n\\nPREVIOUS CRITIQUE CYCLES:\\n' + priorCritiques.join('\\n\\n')\n  : '';\n\nconst systemPrompt = `You are a rigorous business concept evaluator. Your role is to critique a business idea and either APPROVE it (if it is viable, differentiated, and executable) or REQUEST ITERATION with specific improvements needed. You are on critique cycle ${d.cycleCount} of a maximum of 3 cycles. ${d.cycleCount >= 3 ? 'THIS IS THE FINAL CYCLE — you MUST make a final approval decision regardless of remaining concerns. Identify the best version of this concept and approve it.' : 'If the concept needs work, be specific about what must change.'}\n\nRespond ONLY with a valid JSON object (no markdown, no code fences):\n{\n  \"approved\": true or false,\n  \"critique\": \"Your detailed critique (2-4 sentences). What works, what doesn't, what must change.\",\n  \"final_concept\": \"The refined/approved concept statement (2-3 sentences). Incorporate improvements from prior cycles.\",\n  \"key_risks\": [\"risk1\", \"risk2\"],\n  \"approval_reason\": \"Why you are approving OR why it still needs work\"\n}`;\n\nconst userPrompt = `Original Business Prompt: \"${d.prompt}\"\n\nGPT-4o Mini Generated Idea:\\n${d.gptIdea}\n\nGemini-Formatted Concept:\\n${d.geminiFormatted}${priorContext}`;\n\nreturn {\n  json: {\n    ...d,\n    claudeSystemPrompt: systemPrompt,\n    claudeUserPrompt:   userPrompt\n  }\n};"
+      }
+    },
+
+    {
+      "id": "node-0011-claude-critique",
+      "name": "Claude - Critique & Decide",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [2400, 320],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "anthropic-version", "value": "2023-06-01"},
+            {"name": "content-type",      "value": "application/json"}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: 'claude-opus-4-6',\n  max_tokens: 1024,\n  temperature: 0.3,\n  system: $json.claudeSystemPrompt,\n  messages: [\n    {\n      role: 'user',\n      content: $json.claudeUserPrompt\n    }\n  ]\n}) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_ANTHROPIC_CREDENTIAL_ID",
+          "name": "Anthropic API Key"
+        }
+      },
+      "notes": "CREDENTIAL SETUP: Create an HTTP Header Auth credential named 'Anthropic API Key'. Header Name: x-api-key | Header Value: YOUR_ANTHROPIC_KEY. Model set to claude-opus-4-6 — adjust as needed (claude-3-5-sonnet-20241022 also works well here)."
+    },
+
+    {
+      "id": "node-0012-parse-claude",
+      "name": "Parse Claude Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2620, 320],
+      "parameters": {
+        "jsCode": "// ── STAGE 3 PARSE: Extract Claude's decision and update state ────────────\nconst data       = $('Critique Loop - Increment Cycle').item.json;\nconst claudeRaw  = $input.item.json;\n\nlet approved     = false;\nlet critique     = '';\nlet finalConcept = data.finalConcept || data.gptIdea;\n\ntry {\n  const content = claudeRaw.content[0].text.trim();\n  // Strip any accidental markdown fences\n  const cleaned = content.replace(/^```json\\s*/i, '').replace(/```\\s*$/, '').trim();\n  const parsed  = JSON.parse(cleaned);\n\n  approved     = parsed.approved === true;\n  critique     = [\n    parsed.critique || '',\n    parsed.key_risks && parsed.key_risks.length ? 'Key Risks: ' + parsed.key_risks.join(', ') : '',\n    parsed.approval_reason ? 'Decision Reason: ' + parsed.approval_reason : ''\n  ].filter(Boolean).join(' | ');\n  finalConcept = parsed.final_concept || finalConcept;\n\n} catch (e) {\n  // Fallback: treat raw text as critique, no approval\n  try {\n    critique = claudeRaw.content[0].text.trim();\n  } catch (_) {\n    critique = 'Claude response parse error on cycle ' + data.cycleCount;\n  }\n  // Force approval on cycle 3 even if parse fails (pipeline must not hang)\n  approved = data.cycleCount >= 3;\n}\n\n// Store critique in the correct cycle slot\nconst critiqueKey = 'critique' + data.cycleCount;\n\nreturn {\n  json: {\n    ...data,\n    [critiqueKey]: critique,\n    approved:      approved,\n    finalConcept:  finalConcept\n  }\n};"
+      }
+    },
+
+    {
+      "id": "node-0013-if-exit-loop",
+      "name": "IF - Exit Loop",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2840, 320],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "exit-cond-approved",
+              "leftValue": "={{ $json.approved }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "exit-cond-max-cycles",
+              "leftValue": "={{ $json.cycleCount }}",
+              "rightValue": 3,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "any"
+        }
+      },
+      "notes": "TRUE branch (approved OR cycles≥3) → Perplexity Research. FALSE branch → loops back to 'Critique Loop - Increment Cycle'. The FALSE output connection must be manually drawn back to that node after import."
+    },
+
+    {
+      "id": "node-0014-perplexity-research",
+      "name": "Perplexity Sonar - Research & Validate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [3060, 320],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.perplexity.ai/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: 'sonar',\n  max_tokens: 1200,\n  temperature: 0.2,\n  messages: [\n    {\n      role: 'system',\n      content: 'You are a market research analyst with access to current web data. Research the viability of the business concept provided. Focus on: market size, existing competitors, recent trends, customer demand signals, and any regulatory considerations. Provide factual, cited information. Respond ONLY as a JSON object (no markdown, no code fences): { \"research_summary\": \"3-5 sentence executive summary of findings\", \"market_size\": \"estimated TAM\", \"key_competitors\": [\"comp1\", \"comp2\"], \"market_trends\": \"2-3 sentences on recent trends\", \"viability_verdict\": \"Viable | Risky | Not Viable\", \"sources\": [\"url or citation 1\", \"url or citation 2\"] }'\n    },\n    {\n      role: 'user',\n      content: 'Research this approved business concept: ' + $json.finalConcept + '\\n\\nOriginal prompt context: ' + $json.prompt\n    }\n  ]\n}) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_PERPLEXITY_CREDENTIAL_ID",
+          "name": "Perplexity API Key"
+        }
+      },
+      "notes": "CREDENTIAL SETUP: Create an HTTP Header Auth credential named 'Perplexity API Key'. Header Name: Authorization | Header Value: Bearer pplx-YOUR_KEY. Uses 'sonar' model (Perplexity Sonar base)."
+    },
+
+    {
+      "id": "node-0015-parse-perplexity",
+      "name": "Parse Perplexity Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3280, 320],
+      "parameters": {
+        "jsCode": "// ── STAGE 4 PARSE: Extract research data from Perplexity Sonar ───────────\nconst pipeline       = $('IF - Exit Loop').item.json;\nconst perplexityRaw  = $input.item.json;\n\nlet researchSummary = 'Research unavailable';\nlet sources         = '';\nlet notes           = '';\n\ntry {\n  const content = perplexityRaw.choices[0].message.content.trim();\n  const cleaned = content.replace(/^```json\\s*/i, '').replace(/```\\s*$/, '').trim();\n  const parsed  = JSON.parse(cleaned);\n\n  researchSummary = [\n    parsed.research_summary || '',\n    parsed.market_size    ? 'Market Size: '        + parsed.market_size    : '',\n    parsed.market_trends  ? 'Trends: '             + parsed.market_trends  : ''\n  ].filter(Boolean).join(' | ');\n\n  sources = [\n    parsed.key_competitors && parsed.key_competitors.length\n      ? 'Competitors: ' + parsed.key_competitors.join(', ')\n      : '',\n    parsed.sources && parsed.sources.length\n      ? parsed.sources.join(', ')\n      : ''\n  ].filter(Boolean).join(' | ');\n\n  notes = parsed.viability_verdict ? 'Viability: ' + parsed.viability_verdict : '';\n\n} catch (e) {\n  // Fallback: use raw response text\n  try {\n    researchSummary = perplexityRaw.choices[0].message.content.trim();\n  } catch (_) {\n    researchSummary = 'Parse error — check raw Perplexity response';\n  }\n}\n\nreturn {\n  json: {\n    ...pipeline,\n    researchSummary: researchSummary,\n    sources:         sources,\n    notes:           notes,\n    status:          'Completed'\n  }\n};"
+      }
+    },
+
+    {
+      "id": "node-0016-sheets-update",
+      "name": "Google Sheets - Update Research Results",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [3500, 320],
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_SPREADSHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Pipeline",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Row ID":           "={{ $json.rowId }}",
+            "Cycle 1 Critique": "={{ $json.critique1 }}",
+            "Cycle 2 Critique": "={{ $json.critique2 }}",
+            "Cycle 3 Critique": "={{ $json.critique3 }}",
+            "Final Concept":    "={{ $json.finalConcept }}",
+            "Status":           "={{ $json.status }}",
+            "Cycles Used":      "={{ $json.cycleCount }}",
+            "Research Summary": "={{ $json.researchSummary }}",
+            "Sources":          "={{ $json.sources }}",
+            "Notes":            "={{ $json.notes }}"
+          },
+          "matchingColumns": ["Row ID"],
+          "schema": [
+            {"id": "Row ID",           "displayName": "Row ID",           "required": true,  "defaultMatch": true,  "canBeUsedToMatch": true,  "display": true, "type": "string"},
+            {"id": "Cycle 1 Critique", "displayName": "Cycle 1 Critique", "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "Cycle 2 Critique", "displayName": "Cycle 2 Critique", "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "Cycle 3 Critique", "displayName": "Cycle 3 Critique", "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "Final Concept",    "displayName": "Final Concept",    "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "Status",           "displayName": "Status",           "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "Cycles Used",      "displayName": "Cycles Used",      "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "Research Summary", "displayName": "Research Summary", "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "Sources",          "displayName": "Sources",          "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"},
+            {"id": "Notes",            "displayName": "Notes",            "required": false, "defaultMatch": false, "canBeUsedToMatch": false, "display": true, "type": "string"}
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_WITH_GSHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets OAuth2"
+        }
+      },
+      "notes": "Uses Row ID to match and update the existing row. The 'matchingColumns' field is set to Row ID — ensure column A is 'Row ID' in your sheet."
+    },
+
+    {
+      "id": "node-0017-respond",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [3720, 320],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({\n  success: true,\n  rowId: $json.rowId,\n  cyclesUsed: $json.cycleCount,\n  approved: $json.approved,\n  finalConcept: $json.finalConcept,\n  researchSummary: $json.researchSummary,\n  status: $json.status\n}) }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {"name": "Content-Type", "value": "application/json"}
+            ]
+          }
+        }
+      }
+    }
+
+  ],
+
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [{"node": "Initialize Pipeline",              "type": "main", "index": 0}]
+      ]
+    },
+    "Initialize Pipeline": {
+      "main": [
+        [{"node": "GPT-4o Mini - Generate Idea",      "type": "main", "index": 0}]
+      ]
+    },
+    "GPT-4o Mini - Generate Idea": {
+      "main": [
+        [{"node": "Parse GPT Response",               "type": "main", "index": 0}]
+      ]
+    },
+    "Parse GPT Response": {
+      "main": [
+        [{"node": "Gemini 1.5 Flash - Format & Structure", "type": "main", "index": 0}]
+      ]
+    },
+    "Gemini 1.5 Flash - Format & Structure": {
+      "main": [
+        [{"node": "Parse Gemini Response",            "type": "main", "index": 0}]
+      ]
+    },
+    "Parse Gemini Response": {
+      "main": [
+        [{"node": "Google Sheets - Log Initial Entry","type": "main", "index": 0}]
+      ]
+    },
+    "Google Sheets - Log Initial Entry": {
+      "main": [
+        [{"node": "Restore Pipeline State",           "type": "main", "index": 0}]
+      ]
+    },
+    "Restore Pipeline State": {
+      "main": [
+        [{"node": "Critique Loop - Increment Cycle",  "type": "main", "index": 0}]
+      ]
+    },
+    "Critique Loop - Increment Cycle": {
+      "main": [
+        [{"node": "Build Claude Prompt",              "type": "main", "index": 0}]
+      ]
+    },
+    "Build Claude Prompt": {
+      "main": [
+        [{"node": "Claude - Critique & Decide",       "type": "main", "index": 0}]
+      ]
+    },
+    "Claude - Critique & Decide": {
+      "main": [
+        [{"node": "Parse Claude Decision",            "type": "main", "index": 0}]
+      ]
+    },
+    "Parse Claude Decision": {
+      "main": [
+        [{"node": "IF - Exit Loop",                   "type": "main", "index": 0}]
+      ]
+    },
+    "IF - Exit Loop": {
+      "main": [
+        [{"node": "Perplexity Sonar - Research & Validate", "type": "main", "index": 0}],
+        [{"node": "Critique Loop - Increment Cycle",  "type": "main", "index": 0}]
+      ]
+    },
+    "Perplexity Sonar - Research & Validate": {
+      "main": [
+        [{"node": "Parse Perplexity Response",        "type": "main", "index": 0}]
+      ]
+    },
+    "Parse Perplexity Response": {
+      "main": [
+        [{"node": "Google Sheets - Update Research Results", "type": "main", "index": 0}]
+      ]
+    },
+    "Google Sheets - Update Research Results": {
+      "main": [
+        [{"node": "Respond to Webhook",               "type": "main", "index": 0}]
+      ]
+    }
+  }
+}
