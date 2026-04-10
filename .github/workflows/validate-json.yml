@@ -1,0 +1,108 @@
+name: Validate n8n Workflow JSON
+
+on:
+  push:
+    paths:
+      - 'workflows/**.json'
+  pull_request:
+    paths:
+      - 'workflows/**.json'
+
+jobs:
+  validate:
+    name: Validate Workflow JSON Files
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate all workflow JSON files
+        run: |
+          echo "Scanning workflows/ for .json files..."
+          FAILED=0
+          FILE_COUNT=0
+
+          for f in workflows/*.json; do
+            if [ -f "$f" ]; then
+              FILE_COUNT=$((FILE_COUNT + 1))
+              echo -n "  Checking $f ... "
+
+              # 1. Basic JSON validity
+              if ! python3 -c "import json, sys; json.load(open('$f'))" 2>/dev/null; then
+                echo "INVALID JSON"
+                FAILED=$((FAILED + 1))
+                continue
+              fi
+
+              # 2. Required n8n fields
+              python3 - <<EOF
+          import json, sys
+          with open('$f') as fh:
+              data = json.load(fh)
+          required = ['name', 'nodes', 'connections']
+          missing = [r for r in required if r not in data]
+          if missing:
+              print('MISSING_FIELDS:' + ','.join(missing))
+              sys.exit(1)
+          if not isinstance(data['nodes'], list) or len(data['nodes']) == 0:
+              print('MISSING_FIELDS:nodes array is empty')
+              sys.exit(1)
+          print('OK')
+          EOF
+              RESULT=$?
+              if [ $RESULT -ne 0 ]; then
+                echo "Missing required n8n fields"
+                FAILED=$((FAILED + 1))
+                continue
+              fi
+
+              # 3. Check for leftover placeholder values
+              if grep -q "REPLACE_WITH_" "$f"; then
+                echo "WARNING: Contains REPLACE_WITH_ placeholders (must be filled in n8n)"
+              fi
+
+              # 4. Check no hardcoded secrets
+              if grep -qE '"(sk-|pplx-|AIza)[A-Za-z0-9_-]{10,}"' "$f"; then
+                echo "SECURITY: Possible hardcoded API key detected!"
+                FAILED=$((FAILED + 1))
+                continue
+              fi
+
+              echo "Valid"
+            fi
+          done
+
+          echo ""
+          echo "Files checked: $FILE_COUNT"
+          echo "Failures:      $FAILED"
+
+          if [ $FAILED -gt 0 ]; then
+            echo "Validation failed - $FAILED file(s) have errors."
+            exit 1
+          else
+            echo "All workflow files passed validation."
+          fi
+
+      - name: Report node count summary
+        if: success()
+        run: |
+          echo "Workflow Summary:"
+          for f in workflows/*.json; do
+            if [ -f "$f" ]; then
+              python3 - <<EOF
+          import json
+          with open('$f') as fh:
+              data = json.load(fh)
+          name  = data.get('name', '$f')
+          nodes = len(data.get('nodes', []))
+          conns = len(data.get('connections', {}))
+          print(f"  {name}: {nodes} nodes, {conns} connection entries")
+          EOF
+            fi
+          done
